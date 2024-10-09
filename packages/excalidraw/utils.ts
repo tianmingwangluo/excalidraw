@@ -1,20 +1,21 @@
+import { average } from "../math";
 import { COLOR_PALETTE } from "./colors";
+import type { EVENT } from "./constants";
 import {
   DEFAULT_VERSION,
-  EVENT,
   FONT_FAMILY,
   isDarwin,
   WINDOWS_EMOJI_FALLBACK_FONT,
 } from "./constants";
-import { FontFamilyValues, FontString } from "./element/types";
-import {
+import type { FontFamilyValues, FontString } from "./element/types";
+import type {
   ActiveTool,
   AppState,
   ToolType,
   UnsubscribeCallback,
   Zoom,
 } from "./types";
-import { ResolutionType } from "./utility-types";
+import type { MaybePromise, ResolutionType } from "./utility-types";
 
 let mockDateTime: string | null = null;
 
@@ -88,6 +89,7 @@ export const getFontFamilyString = ({
 }) => {
   for (const [fontFamilyString, id] of Object.entries(FONT_FAMILY)) {
     if (id === fontFamily) {
+      // TODO: we should fallback first to generic family names first, rather than directly to the emoji font
       return `${fontFamilyString}, ${WINDOWS_EMOJI_FALLBACK_FONT}`;
     }
   }
@@ -538,7 +540,9 @@ export const isTransparent = (color: string) => {
 };
 
 export type ResolvablePromise<T> = Promise<T> & {
-  resolve: [T] extends [undefined] ? (value?: T) => void : (value: T) => void;
+  resolve: [T] extends [undefined]
+    ? (value?: MaybePromise<Awaited<T>>) => void
+    : (value: MaybePromise<Awaited<T>>) => void;
   reject: (error: Error) => void;
 };
 export const resolvablePromise = <T>() => {
@@ -650,8 +654,11 @@ export const getUpdatedTimestamp = () => (isTestEnv() ? 1 : Date.now());
  * or array of ids (strings), into a Map, keyd by `id`.
  */
 export const arrayToMap = <T extends { id: string } | string>(
-  items: readonly T[],
+  items: readonly T[] | Map<string, T>,
 ) => {
+  if (items instanceof Map) {
+    return items;
+  }
   return items.reduce((acc: Map<string, T>, element) => {
     acc.set(typeof element === "string" ? element : element.id, element);
     return acc;
@@ -666,7 +673,53 @@ export const arrayToMapWithIndex = <T extends { id: string }>(
     return acc;
   }, new Map<string, [element: T, index: number]>());
 
+/**
+ * Transform array into an object, use only when array order is irrelevant.
+ */
+export const arrayToObject = <T>(
+  array: readonly T[],
+  groupBy?: (value: T) => string | number,
+) =>
+  array.reduce((acc, value) => {
+    acc[groupBy ? groupBy(value) : String(value)] = value;
+    return acc;
+  }, {} as { [key: string]: T });
+
+/** Doubly linked node */
+export type Node<T> = T & {
+  prev: Node<T> | null;
+  next: Node<T> | null;
+};
+
+/**
+ * Creates a circular doubly linked list by adding `prev` and `next` props to the existing array nodes.
+ */
+export const arrayToList = <T>(array: readonly T[]): Node<T>[] =>
+  array.reduce((acc, curr, index) => {
+    const node: Node<T> = { ...curr, prev: null, next: null };
+
+    // no-op for first item, we don't want circular references on a single item
+    if (index !== 0) {
+      const prevNode = acc[index - 1];
+      node.prev = prevNode;
+      prevNode.next = node;
+
+      if (index === array.length - 1) {
+        // make the references circular and connect head & tail
+        const firstNode = acc[0];
+        node.next = firstNode;
+        firstNode.prev = node;
+      }
+    }
+
+    acc.push(node);
+
+    return acc;
+  }, [] as Node<T>[]);
+
 export const isTestEnv = () => import.meta.env.MODE === "test";
+
+export const isDevEnv = () => import.meta.env.MODE === "development";
 
 export const wrapEvent = <T extends Event>(name: EVENT, nativeEvent: T) => {
   return new CustomEvent(name, {
@@ -786,6 +839,14 @@ export const isShallowEqual = <
   const aKeys = Object.keys(objA);
   const bKeys = Object.keys(objB);
   if (aKeys.length !== bKeys.length) {
+    if (debug) {
+      console.warn(
+        `%cisShallowEqual: objects don't have same properties ->`,
+        "color: #8B4000",
+        objA,
+        objB,
+      );
+    }
     return false;
   }
 
@@ -842,7 +903,7 @@ export const composeEventHandlers = <E>(
 
     if (
       !checkForDefaultPrevented ||
-      !(event as unknown as Event).defaultPrevented
+      !(event as unknown as Event)?.defaultPrevented
     ) {
       return ourEventHandler?.(event);
     }
@@ -868,6 +929,12 @@ export const assertNever = (
 
   throw new Error(message);
 };
+
+export function invariant(condition: any, message: string): asserts condition {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
 
 /**
  * Memoizes on values of `opts` object (strict equality).
@@ -925,10 +992,6 @@ export const isMemberOf = <T extends string>(
 };
 
 export const cloneJSON = <T>(obj: T): T => JSON.parse(JSON.stringify(obj));
-
-export const isFiniteNumber = (value: any): value is number => {
-  return typeof value === "number" && Number.isFinite(value);
-};
 
 export const updateStable = <T extends any[] | Record<string, any>>(
   prevValue: T,
@@ -1013,7 +1076,6 @@ export function addEventListener(
   };
 }
 
-const average = (a: number, b: number) => (a + b) / 2;
 export function getSvgPathFromStroke(points: number[][], closed = true) {
   const len = points.length;
 
@@ -1049,4 +1111,62 @@ export function getSvgPathFromStroke(points: number[][], closed = true) {
 
 export const normalizeEOL = (str: string) => {
   return str.replace(/\r?\n|\r/g, "\n");
+};
+
+// -----------------------------------------------------------------------------
+type HasBrand<T> = {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  [K in keyof T]: K extends `~brand${infer _}` ? true : never;
+}[keyof T];
+
+type RemoveAllBrands<T> = HasBrand<T> extends true
+  ? {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      [K in keyof T as K extends `~brand~${infer _}` ? never : K]: T[K];
+    }
+  : never;
+
+// adapted from https://github.com/colinhacks/zod/discussions/1994#discussioncomment-6068940
+// currently does not cover all types (e.g. tuples, promises...)
+type Unbrand<T> = T extends Map<infer E, infer F>
+  ? Map<E, F>
+  : T extends Set<infer E>
+  ? Set<E>
+  : T extends Array<infer E>
+  ? Array<E>
+  : RemoveAllBrands<T>;
+
+/**
+ * Makes type into a branded type, ensuring that value is assignable to
+ * the base ubranded type. Optionally you can explicitly supply current value
+ * type to combine both (useful for composite branded types. Make sure you
+ * compose branded types which are not composite themselves.)
+ */
+export const toBrandedType = <BrandedType, CurrentType = BrandedType>(
+  value: Unbrand<BrandedType>,
+) => {
+  return value as CurrentType & BrandedType;
+};
+
+// -----------------------------------------------------------------------------
+
+// Promise.try, adapted from https://github.com/sindresorhus/p-try
+export const promiseTry = async <TValue, TArgs extends unknown[]>(
+  fn: (...args: TArgs) => PromiseLike<TValue> | TValue,
+  ...args: TArgs
+): Promise<TValue> => {
+  return new Promise((resolve) => {
+    resolve(fn(...args));
+  });
+};
+
+export const isAnyTrue = (...args: boolean[]): boolean =>
+  Math.max(...args.map((arg) => (arg ? 1 : 0))) > 0;
+
+export const safelyParseJSON = (json: string): Record<string, any> | null => {
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
 };

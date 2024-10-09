@@ -1,23 +1,22 @@
 import rough from "roughjs/bin/rough";
-import {
+import type {
   ExcalidrawElement,
   ExcalidrawFrameLikeElement,
   ExcalidrawTextElement,
   NonDeletedExcalidrawElement,
+  NonDeletedSceneElementsMap,
 } from "../element/types";
-import {
-  Bounds,
-  getCommonBounds,
-  getElementAbsoluteCoords,
-} from "../element/bounds";
-import { renderSceneToSvg, renderStaticScene } from "../renderer/renderScene";
-import { cloneJSON, distance, getFontString } from "../utils";
-import { AppState, BinaryFiles } from "../types";
+import type { Bounds } from "../element/bounds";
+import { getCommonBounds, getElementAbsoluteCoords } from "../element/bounds";
+import { renderSceneToSvg } from "../renderer/staticSvgScene";
+import { arrayToMap, distance, getFontString, toBrandedType } from "../utils";
+import type { AppState, BinaryFiles } from "../types";
 import {
   DEFAULT_EXPORT_PADDING,
-  FONT_FAMILY,
   FRAME_STYLE,
+  FONT_FAMILY,
   SVG_NS,
+  THEME,
   THEME_FILTER,
 } from "../constants";
 import { getDefaultAppState } from "../appState";
@@ -26,42 +25,23 @@ import {
   getInitializedImageElements,
   updateImageCache,
 } from "../element/image";
-import { elementsOverlappingBBox } from "../../utils/export";
 import {
+  getElementsOverlappingFrame,
   getFrameLikeElements,
   getFrameLikeTitle,
   getRootElements,
 } from "../frame";
 import { newTextElement } from "../element";
-import { Mutable } from "../utility-types";
+import { type Mutable } from "../utility-types";
 import { newElementWith } from "../element/mutateElement";
-import Scene from "./Scene";
-import { isFrameElement, isFrameLikeElement } from "../element/typeChecks";
+import { isFrameLikeElement, isTextElement } from "../element/typeChecks";
+import type { RenderableElementsMap } from "./types";
+import { syncInvalidIndices } from "../fractionalIndex";
+import { renderStaticScene } from "../renderer/staticScene";
+import { Fonts } from "../fonts";
+import type { Font } from "../fonts/ExcalidrawFont";
 
 const SVG_EXPORT_TAG = `<!-- svg-source:excalidraw -->`;
-
-// getContainerElement and getBoundTextElement and potentially other helpers
-// depend on `Scene` which will not be available when these pure utils are
-// called outside initialized Excalidraw editor instance or even if called
-// from inside Excalidraw if the elements were never cached by Scene (e.g.
-// for library elements).
-//
-// As such, before passing the elements down, we need to initialize a custom
-// Scene instance and assign them to it.
-//
-// FIXME This is a super hacky workaround and we'll need to rewrite this soon.
-const __createSceneForElementsHack__ = (
-  elements: readonly ExcalidrawElement[],
-) => {
-  const scene = new Scene();
-  // we can't duplicate elements to regenerate ids because we need the
-  // orig ids when embedding. So we do another hack of not mapping element
-  // ids to Scene instances so that we don't override the editor elements
-  // mapping.
-  // We still need to clone the objects themselves to regen references.
-  scene.replaceAllElements(cloneJSON(elements), false);
-  return scene;
-};
 
 const truncateText = (element: ExcalidrawTextElement, maxWidth: number) => {
   if (element.width <= maxWidth) {
@@ -105,29 +85,19 @@ const addFrameLabelsAsTextElements = (
   opts: Pick<AppState, "exportWithDarkMode">,
 ) => {
   const nextElements: NonDeletedExcalidrawElement[] = [];
-  let frameIndex = 0;
-  let magicFrameIndex = 0;
   for (const element of elements) {
     if (isFrameLikeElement(element)) {
-      if (isFrameElement(element)) {
-        frameIndex++;
-      } else {
-        magicFrameIndex++;
-      }
       let textElement: Mutable<ExcalidrawTextElement> = newTextElement({
         x: element.x,
         y: element.y - FRAME_STYLE.nameOffsetY,
-        fontFamily: FONT_FAMILY.Assistant,
+        fontFamily: FONT_FAMILY.Helvetica,
         fontSize: FRAME_STYLE.nameFontSize,
         lineHeight:
           FRAME_STYLE.nameLineHeight as ExcalidrawTextElement["lineHeight"],
         strokeColor: opts.exportWithDarkMode
           ? FRAME_STYLE.nameColorDarkTheme
           : FRAME_STYLE.nameColorLightTheme,
-        text: getFrameLikeTitle(
-          element,
-          isFrameElement(element) ? frameIndex : magicFrameIndex,
-        ),
+        text: getFrameLikeTitle(element),
       });
       textElement.y -= textElement.height;
 
@@ -168,11 +138,7 @@ const prepareElementsForRender = ({
   let nextElements: readonly ExcalidrawElement[];
 
   if (exportingFrame) {
-    nextElements = elementsOverlappingBBox({
-      elements,
-      bounds: exportingFrame,
-      type: "overlap",
-    });
+    nextElements = getElementsOverlappingFrame(elements, exportingFrame);
   } else if (frameRendering.enabled && frameRendering.name) {
     nextElements = addFrameLabelsAsTextElements(elements, {
       exportWithDarkMode,
@@ -208,14 +174,22 @@ export const exportToCanvas = async (
     canvas.height = height * appState.exportScale;
     return { canvas, scale: appState.exportScale };
   },
+  loadFonts: () => Promise<void> = async () => {
+    await Fonts.loadFontsForElements(elements);
+  },
 ) => {
-  const tempScene = __createSceneForElementsHack__(elements);
-  elements = tempScene.getNonDeletedElements();
+  // load font faces before continuing, by default leverages browsers' [FontFace API](https://developer.mozilla.org/en-US/docs/Web/API/FontFace)
+  await loadFonts();
 
   const frameRendering = getFrameRenderingConfig(
     exportingFrame ?? null,
     appState.frameRendering ?? null,
   );
+  // for canvas export, don't clip if exporting a specific frame as it would
+  // clip the corners of the content
+  if (exportingFrame) {
+    frameRendering.clip = false;
+  }
 
   const elementsForRender = prepareElementsForRender({
     elements,
@@ -248,7 +222,12 @@ export const exportToCanvas = async (
   renderStaticScene({
     canvas,
     rc: rough.canvas(canvas),
-    elements: elementsForRender,
+    elementsMap: toBrandedType<RenderableElementsMap>(
+      arrayToMap(elementsForRender),
+    ),
+    allElementsMap: toBrandedType<NonDeletedSceneElementsMap>(
+      arrayToMap(syncInvalidIndices(elements)),
+    ),
     visibleElements: elementsForRender,
     scale,
     appState: {
@@ -259,7 +238,7 @@ export const exportToCanvas = async (
       scrollY: -minY + exportPadding,
       zoom: defaultAppState.zoom,
       shouldCacheIgnoreZoom: false,
-      theme: appState.exportWithDarkMode ? "dark" : "light",
+      theme: appState.exportWithDarkMode ? THEME.DARK : THEME.LIGHT,
     },
     renderConfig: {
       canvasBackgroundColor: viewBackgroundColor,
@@ -269,10 +248,9 @@ export const exportToCanvas = async (
       // empty disables embeddable rendering
       embedsValidationStatus: new Map(),
       elementsPendingErasure: new Set(),
+      pendingFlowchartNodes: null,
     },
   });
-
-  tempScene.destroy();
 
   return canvas;
 };
@@ -295,11 +273,9 @@ export const exportToSvg = async (
      */
     renderEmbeddables?: boolean;
     exportingFrame?: ExcalidrawFrameLikeElement | null;
+    skipInliningFonts?: true;
   },
 ): Promise<SVGSVGElement> => {
-  const tempScene = __createSceneForElementsHack__(elements);
-  elements = tempScene.getNonDeletedElements();
-
   const frameRendering = getFrameRenderingConfig(
     opts?.exportingFrame ?? null,
     appState.frameRendering ?? null,
@@ -362,29 +338,15 @@ export const exportToSvg = async (
     svgRoot.setAttribute("filter", THEME_FILTER);
   }
 
-  let assetPath = "https://excalidraw.com/";
-  // Asset path needs to be determined only when using package
-  if (import.meta.env.VITE_IS_EXCALIDRAW_NPM_PACKAGE) {
-    assetPath =
-      window.EXCALIDRAW_ASSET_PATH ||
-      `https://unpkg.com/${import.meta.env.VITE_PKG_NAME}@${
-        import.meta.env.PKG_VERSION
-      }`;
-
-    if (assetPath?.startsWith("/")) {
-      assetPath = assetPath.replace("/", `${window.location.origin}/`);
-    }
-    assetPath = `${assetPath}/dist/excalidraw-assets/`;
-  }
-
   const offsetX = -minX + exportPadding;
   const offsetY = -minY + exportPadding;
 
   const frameElements = getFrameLikeElements(elements);
 
   let exportingFrameClipPath = "";
+  const elementsMap = arrayToMap(elements);
   for (const frame of frameElements) {
-    const [x1, y1, x2, y2] = getElementAbsoluteCoords(frame);
+    const [x1, y1, x2, y2] = getElementAbsoluteCoords(frame, elementsMap);
     const cx = (x2 - x1) / 2 - (frame.x - x1);
     const cy = (y2 - y1) / 2 - (frame.y - y1);
 
@@ -394,28 +356,24 @@ export const exportToSvg = async (
     }) rotate(${frame.angle} ${cx} ${cy})"
           width="${frame.width}"
           height="${frame.height}"
+          ${
+            exportingFrame
+              ? ""
+              : `rx=${FRAME_STYLE.radius} ry=${FRAME_STYLE.radius}`
+          }
           >
           </rect>
         </clipPath>`;
   }
+
+  const fontFaces = opts?.skipInliningFonts ? [] : await getFontFaces(elements);
 
   svgRoot.innerHTML = `
   ${SVG_EXPORT_TAG}
   ${metadata}
   <defs>
     <style class="style-fonts">
-      @font-face {
-        font-family: "Virgil";
-        src: url("${assetPath}Virgil.woff2");
-      }
-      @font-face {
-        font-family: "Cascadia";
-        src: url("${assetPath}Cascadia.woff2");
-      }
-      @font-face {
-        font-family: "Assistant";
-        src: url("${assetPath}Assistant-Regular.woff2");
-      }
+      ${fontFaces.join("\n")}
     </style>
     ${exportingFrameClipPath}
   </defs>
@@ -436,24 +394,29 @@ export const exportToSvg = async (
 
   const renderEmbeddables = opts?.renderEmbeddables ?? false;
 
-  renderSceneToSvg(elementsForRender, rsvg, svgRoot, files || {}, {
-    offsetX,
-    offsetY,
-    isExporting: true,
-    exportWithDarkMode,
-    renderEmbeddables,
-    frameRendering,
-    canvasBackgroundColor: viewBackgroundColor,
-    embedsValidationStatus: renderEmbeddables
-      ? new Map(
-          elementsForRender
-            .filter((element) => isFrameLikeElement(element))
-            .map((element) => [element.id, true]),
-        )
-      : new Map(),
-  });
-
-  tempScene.destroy();
+  renderSceneToSvg(
+    elementsForRender,
+    toBrandedType<RenderableElementsMap>(arrayToMap(elementsForRender)),
+    rsvg,
+    svgRoot,
+    files || {},
+    {
+      offsetX,
+      offsetY,
+      isExporting: true,
+      exportWithDarkMode,
+      renderEmbeddables,
+      frameRendering,
+      canvasBackgroundColor: viewBackgroundColor,
+      embedsValidationStatus: renderEmbeddables
+        ? new Map(
+            elementsForRender
+              .filter((element) => isFrameLikeElement(element))
+              .map((element) => [element.id, true]),
+          )
+        : new Map(),
+    },
+  );
 
   return svgRoot;
 };
@@ -480,4 +443,68 @@ export const getExportSize = (
   );
 
   return [width, height];
+};
+
+const getFontFaces = async (
+  elements: readonly ExcalidrawElement[],
+): Promise<string[]> => {
+  const fontFamilies = new Set<number>();
+  const codePoints = new Set<number>();
+
+  for (const element of elements) {
+    if (!isTextElement(element)) {
+      continue;
+    }
+
+    fontFamilies.add(element.fontFamily);
+
+    // gather unique codepoints only when inlining fonts
+    for (const codePoint of Array.from(element.originalText, (u) =>
+      u.codePointAt(0),
+    )) {
+      if (codePoint) {
+        codePoints.add(codePoint);
+      }
+    }
+  }
+
+  const getSource = (font: Font) => {
+    try {
+      // retrieve font source as dataurl based on the used codepoints
+      return font.getContent(codePoints);
+    } catch {
+      // fallback to font source as a url
+      return font.urls[0].toString();
+    }
+  };
+
+  const fontFaces = await Promise.all(
+    Array.from(fontFamilies).map(async (x) => {
+      const { fonts, metadata } = Fonts.registered.get(x) ?? {};
+
+      if (!Array.isArray(fonts)) {
+        console.error(
+          `Couldn't find registered fonts for font-family "${x}"`,
+          Fonts.registered,
+        );
+        return [];
+      }
+
+      if (metadata?.local) {
+        // don't inline local fonts
+        return [];
+      }
+
+      return Promise.all(
+        fonts.map(
+          async (font) => `@font-face {
+        font-family: ${font.fontFace.family};
+        src: url(${await getSource(font)});
+          }`,
+        ),
+      );
+    }),
+  );
+
+  return fontFaces.flat();
 };
